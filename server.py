@@ -7,30 +7,34 @@ from threading import Lock
 
 app = Flask(__name__)
 
-# Where the blockchain lives on disk
+# Where the blockchain is stored on disk
 CHAIN_FILE = "chain.json"
 
-# Basic emission settings
+# Very simple block reward schedule
 HALVING_INTERVAL = 1000
 INITIAL_REWARD = 4.0
 MIN_REWARD = 0.25
 
-# Difficulty system: 75 = easy, 120 = hard, bigger = harder
+# Difficulty settings:
+#  - 75   = easiest
+#  - 100  = medium
+#  - 120  = hardest
+# Bigger number = harder, smaller = easier.
 MIN_DIFFICULTY = 75
 DEFAULT_DIFFICULTY = 100
 MAX_DIFFICULTY = 120
 
-# Target time between accepted shares per miner (in seconds)
-TARGET_SHARE_TIME = 5
+# How often (on average) a miner should find a valid share
+TARGET_SHARE_TIME = 5  # seconds
 
 # Per-miner state
-miner_difficulty = {}   # current difficulty per miner_id
-last_share_time = {}    # last time a share was accepted per miner_id
+miner_difficulty = {}   # miner_id -> current difficulty
+last_share_time = {}    # miner_id -> last accepted share time
 
-# Simple mempool for user transactions
+# Pending transactions sit here until they get picked up by a block
 mempool = []
 
-# Lock so multiple requests don't corrupt the chain file
+# We touch the chain file from multiple requests, so use a lock
 chain_lock = Lock()
 
 
@@ -39,7 +43,7 @@ def sha1_hex(data: str) -> str:
 
 
 def load_chain():
-    # If there's no chain yet, start with a simple genesis block
+    # If there's no chain yet, spin up a tiny genesis chain
     if not os.path.exists(CHAIN_FILE):
         genesis = [{
             "index": 0,
@@ -67,7 +71,7 @@ def get_height(chain):
 
 
 def compute_balances(chain):
-    # Walk the whole chain and derive balances from transactions
+    # No separate database, just derive balances from the chain itself
     balances = {}
     for block in chain:
         for tx in block.get("transactions", []):
@@ -75,13 +79,13 @@ def compute_balances(chain):
             receiver = tx["to"]
             amount = float(tx["amount"])
             if sender != "network":
-                balances[sender] = balances.get(sender, 0) - amount
-            balances[receiver] = balances.get(receiver, 0) + amount
+                balances[sender] = balances.get(sender, 0.0) - amount
+            balances[receiver] = balances.get(receiver, 0.0) + amount
     return balances
 
 
 def get_block_reward(height):
-    # Simple halving schedule
+    # Simple halving schedule: every HALVING_INTERVAL blocks, reward halves
     halvings = height // HALVING_INTERVAL
     reward = INITIAL_REWARD / (2 ** halvings)
     return max(reward, MIN_REWARD)
@@ -89,31 +93,44 @@ def get_block_reward(height):
 
 def difficulty_to_threshold(diff: int) -> int:
     """
-    Map difficulty 75–120 into a threshold over the first 5 hex digits of SHA-1.
+    Convert a difficulty 75–120 into a numeric threshold on the first 5 hex
+    digits of the SHA-1 hash.
 
-    First 5 hex digits give a value in [0, 1,048,575].
-    Lower threshold = harder, higher threshold = easier.
-    We want:
-        75  (easy) -> high threshold
-        120 (hard) -> low threshold
+    We look at hash[:5] as a hex number, so the raw range is:
+        0 .. 16**5 - 1 = 0 .. 1,048,575
+
+    Rules we want:
+        - Smaller difficulty  (e.g. 75)  = easier  = higher threshold
+        - Bigger difficulty   (e.g. 120) = harder  = lower threshold
+
+    So we map:
+        diff = 75  -> threshold near the top of the range
+        diff = 120 -> threshold much lower, harder to hit
     """
     min_d = MIN_DIFFICULTY
     max_d = MAX_DIFFICULTY
-    max_raw = 1048575  # 16**5 - 1
+    max_raw = 16**5 - 1  # 1,048,575
 
-    easy_threshold = int(max_raw * 0.9)   # pretty forgiving
-    hard_threshold = int(max_raw * 0.2)   # much stricter
+    # These endpoints are somewhat arbitrary, but behave nicely in practice
+    # easy_threshold: pretty forgiving
+    easy_threshold = int(max_raw * 0.9)
+    # hard_threshold: noticeably stricter
+    hard_threshold = int(max_raw * 0.2)
 
     if diff < min_d:
         diff = min_d
     if diff > max_d:
         diff = max_d
 
-    # Linearly interpolate between easy and hard
+    # Linearly interpolate with diff across [min_d, max_d]
+    # diff = min_d -> x = 0 -> easy_threshold
+    # diff = max_d -> x = 1 -> hard_threshold
     x = (diff - min_d) / (max_d - min_d)
     threshold = int(easy_threshold + (hard_threshold - easy_threshold) * x)
     return threshold
 
+
+# ---------------------- Web miner UI ---------------------- #
 
 WEB_MINER_HTML = """
 <!doctype html>
@@ -134,7 +151,7 @@ WEB_MINER_HTML = """
 <body>
   <div class="box">
     <h1>Cadocurrency Web Miner</h1>
-    <p>Mine with just a username. No wallet files, no installs.</p>
+    <p>One username, one browser tab, no wallet files. Just mine.</p>
     <div>
       <input id="username" placeholder="Enter your username">
       <button id="startBtn">Start Mining</button>
@@ -147,6 +164,7 @@ WEB_MINER_HTML = """
       <div class="stat">Block height: <span id="height">-</span></div>
       <div class="stat">Your balance: <span id="balance">0</span> CADO</div>
       <div class="stat">Last block hash: <code id="lasthash"></code></div>
+      <div class="stat">Current difficulty: <span id="diff">-</span></div>
     </div>
   </div>
 
@@ -202,10 +220,12 @@ async function mineLoop() {
       document.getElementById("status").textContent = "Requesting job...";
       const job = await getJob();
       let seed = job.seed;
-      let difficulty = Number(job.difficulty);
+      let difficulty = job.difficulty;
+      let threshold = job.threshold;
       let height = job.height;
 
       document.getElementById("height").textContent = height;
+      document.getElementById("diff").textContent = difficulty;
       document.getElementById("status").textContent = "Mining...";
 
       let nonce = 0n;
@@ -213,26 +233,28 @@ async function mineLoop() {
       let hashes = 0n;
 
       while (mining) {
-        let msg = new TextEncoder().encode(seed + nonce.toString());
-        let digest = await crypto.subtle.digest("SHA-1", msg);
-        let hashArray = Array.from(new Uint8Array(digest));
-        let hex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
+        const msg = new TextEncoder().encode(seed + nonce.toString());
+        const digest = await crypto.subtle.digest("SHA-1", msg);
+        const hashArray = Array.from(new Uint8Array(digest));
+        const hex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 
-        // We only really care about the first 5 hex chars, like the server
-        let shortVal = parseInt(hex.slice(0, 5), 16);
-        // The server decides if it's valid, we just submit everything
+        // First 5 hex digits, same as the server
+        const shortVal = parseInt(hex.slice(0, 5), 16);
         hashes++;
 
-        if (shortVal < 1048576) {
+        // We only bother the server when it looks like a valid share locally
+        if (shortVal < threshold) {
           const res = await submitShare(seed, nonce.toString());
           if (res.accepted) {
             shares++;
             document.getElementById("shares").textContent = shares;
             document.getElementById("balance").textContent = res.balance.toFixed(4);
             document.getElementById("lasthash").textContent = res.hash;
-            document.getElementById("status").textContent = "Share accepted (diff " + res.difficulty + ")";
+            document.getElementById("status").textContent =
+              "Share accepted (diff " + res.difficulty + ", " + res.share_time.toFixed(2) + "s)";
           } else {
-            document.getElementById("status").textContent = "Share rejected: " + (res.error || "");
+            document.getElementById("status").textContent =
+              "Share rejected: " + (res.error || "unknown reason");
           }
           break;
         }
@@ -240,7 +262,7 @@ async function mineLoop() {
         nonce++;
 
         if (hashes % 2000n === 0n) {
-          let elapsed = (performance.now() - start) / 1000;
+          const elapsed = (performance.now() - start) / 1000;
           if (elapsed > 0) {
             hashrate = Number(hashes) / elapsed;
             document.getElementById("hashrate").textContent = Math.floor(hashrate);
@@ -265,6 +287,8 @@ def webminer():
     return Response(WEB_MINER_HTML, mimetype="text/html")
 
 
+# ---------------------- Mining + chain API ---------------------- #
+
 @app.route("/get_job", methods=["POST"])
 def get_job():
     data = request.json or {}
@@ -277,11 +301,13 @@ def get_job():
         reward = get_block_reward(height + 1)
 
         current_diff = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
+        threshold = difficulty_to_threshold(current_diff)
         seed = last_block["hash"]
 
     return jsonify({
         "seed": seed,
         "difficulty": current_diff,
+        "threshold": threshold,
         "height": height + 1,
         "reward": reward
     })
@@ -306,6 +332,7 @@ def submit_share():
         chain = load_chain()
         last_block = chain[-1]
 
+        # If the miner is working on an old seed, reject early
         if seed != last_block["hash"]:
             return jsonify({"accepted": False, "error": "Stale job"}), 400
 
@@ -314,12 +341,14 @@ def submit_share():
         threshold = difficulty_to_threshold(current_diff)
 
         h = sha1_hex(seed + str(nonce))
-        # First 5 hex digits, DUCO-style
+
+        # DUCO-style: only look at the first 5 hex digits for difficulty
         hash_val = int(h[:5], 16)
 
         if hash_val >= threshold:
             return jsonify({"accepted": False, "error": "Invalid share"}), 400
 
+        # At this point the share is good enough to become a block
         reward = get_block_reward(height)
         coinbase_tx = {"from": "network", "to": miner_id, "amount": reward}
 
@@ -331,9 +360,9 @@ def submit_share():
         for tx in mempool:
             sender = tx["from"]
             amount = float(tx["amount"])
-            if balances.get(sender, 0) >= amount:
-                balances[sender] = balances.get(sender, 0) - amount
-                balances[tx["to"]] = balances.get(tx["to"], 0) + amount
+            if balances.get(sender, 0.0) >= amount:
+                balances[sender] = balances.get(sender, 0.0) - amount
+                balances[tx["to"]] = balances.get(tx["to"], 0.0) + amount
                 valid_txs.append(tx)
             else:
                 new_mempool.append(tx)
@@ -355,12 +384,14 @@ def submit_share():
         balances = compute_balances(chain)
         miner_balance = balances.get(miner_id, 0.0)
 
+        # Adaptive difficulty: look at how long this share took
         now = time.time()
         prev_time = last_share_time.get(miner_id, now)
         elapsed = now - prev_time if prev_time != now else TARGET_SHARE_TIME
         last_share_time[miner_id] = now
 
-        # If the miner is too fast, make life harder. If they're slow, ease up.
+        # If the miner is faster than our target, crank difficulty up (harder).
+        # If they're slower, ease difficulty down.
         if elapsed < TARGET_SHARE_TIME:
             current_diff += 1
         else:
@@ -414,9 +445,10 @@ def send():
     with chain_lock:
         chain = load_chain()
         balances = compute_balances(chain)
-        if balances.get(sender, 0) < amount:
+        if balances.get(sender, 0.0) < amount:
             return jsonify({"success": False, "error": "Insufficient balance"}), 400
 
+        # We don't mine the tx into a block immediately, we just queue it
         tx = {"from": sender, "to": receiver, "amount": amount}
         mempool.append(tx)
 
@@ -431,4 +463,6 @@ def get_chain():
 
 
 if __name__ == "__main__":
+    # Local dev entrypoint; in production you'll probably use gunicorn
     app.run(host="0.0.0.0", port=8080)
+
