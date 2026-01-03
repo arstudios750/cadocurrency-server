@@ -96,8 +96,8 @@ def difficulty_to_threshold(diff: int) -> int:
     Convert a difficulty 75–120 into a numeric threshold on the first 5 hex
     digits of the SHA-1 hash.
 
-    We look at hash[:5] as a hex number, so the raw range is:
-        0 .. 16**5 - 1 = 0 .. 1,048,575
+    We look at hash[:6] as a hex number, so the raw range is:
+        0 .. 16**6 - 1 = 0 
 
     Rules we want:
         - Smaller difficulty  (e.g. 75)  = easier  = higher threshold
@@ -109,7 +109,7 @@ def difficulty_to_threshold(diff: int) -> int:
     """
     min_d = MIN_DIFFICULTY
     max_d = MAX_DIFFICULTY
-    max_raw = 16**5 - 1  # 1,048,575
+    max_raw = 16**6 - 1  
 
     # These endpoints are somewhat arbitrary, but behave nicely in practice
     # easy_threshold: pretty forgiving
@@ -238,8 +238,8 @@ async function mineLoop() {
         const hashArray = Array.from(new Uint8Array(digest));
         const hex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 
-        // First 5 hex digits, same as the server
-        const shortVal = parseInt(hex.slice(0, 5), 16);
+        // First 6 hex digits, same as the server
+        const shortVal = parseInt(hex.slice(0, 6), 16);
         hashes++;
 
         // We only bother the server when it looks like a valid share locally
