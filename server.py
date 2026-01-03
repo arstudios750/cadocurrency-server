@@ -7,24 +7,31 @@ from threading import Lock
 
 app = Flask(__name__)
 
+# Where the blockchain lives on disk
 CHAIN_FILE = "chain.json"
 
-# Emission params
+# Basic emission settings
 HALVING_INTERVAL = 1000
 INITIAL_REWARD = 4.0
 MIN_REWARD = 0.25
 
-# Per-user difficulty (Pi vs supercomputer fairness)
-miner_difficulty = {}
-last_share_time = {}
+# Difficulty system: 75 = easy, 120 = hard, bigger = harder
+MIN_DIFFICULTY = 75
+DEFAULT_DIFFICULTY = 100
+MAX_DIFFICULTY = 120
 
-TARGET_SHARE_TIME = 10         # seconds per share per user
-MIN_DIFFICULTY = 2**100
-MAX_DIFFICULTY = 2**150
-DEFAULT_DIFFICULTY = 2**130
+# Target time between accepted shares per miner (in seconds)
+TARGET_SHARE_TIME = 5
 
+# Per-miner state
+miner_difficulty = {}   # current difficulty per miner_id
+last_share_time = {}    # last time a share was accepted per miner_id
+
+# Simple mempool for user transactions
+mempool = []
+
+# Lock so multiple requests don't corrupt the chain file
 chain_lock = Lock()
-mempool = []  # pending txs
 
 
 def sha1_hex(data: str) -> str:
@@ -32,6 +39,7 @@ def sha1_hex(data: str) -> str:
 
 
 def load_chain():
+    # If there's no chain yet, start with a simple genesis block
     if not os.path.exists(CHAIN_FILE):
         genesis = [{
             "index": 0,
@@ -54,7 +62,12 @@ def save_chain(chain):
         json.dump(chain, f, indent=2)
 
 
+def get_height(chain):
+    return len(chain) - 1
+
+
 def compute_balances(chain):
+    # Walk the whole chain and derive balances from transactions
     balances = {}
     for block in chain:
         for tx in block.get("transactions", []):
@@ -67,17 +80,40 @@ def compute_balances(chain):
     return balances
 
 
-def get_height(chain):
-    return len(chain) - 1
-
-
 def get_block_reward(height):
+    # Simple halving schedule
     halvings = height // HALVING_INTERVAL
     reward = INITIAL_REWARD / (2 ** halvings)
     return max(reward, MIN_REWARD)
 
 
-# ---------- Web UI (web miner) ----------
+def difficulty_to_threshold(diff: int) -> int:
+    """
+    Map difficulty 75–120 into a threshold over the first 5 hex digits of SHA-1.
+
+    First 5 hex digits give a value in [0, 1,048,575].
+    Lower threshold = harder, higher threshold = easier.
+    We want:
+        75  (easy) -> high threshold
+        120 (hard) -> low threshold
+    """
+    min_d = MIN_DIFFICULTY
+    max_d = MAX_DIFFICULTY
+    max_raw = 1048575  # 16**5 - 1
+
+    easy_threshold = int(max_raw * 0.9)   # pretty forgiving
+    hard_threshold = int(max_raw * 0.2)   # much stricter
+
+    if diff < min_d:
+        diff = min_d
+    if diff > max_d:
+        diff = max_d
+
+    # Linearly interpolate between easy and hard
+    x = (diff - min_d) / (max_d - min_d)
+    threshold = int(easy_threshold + (hard_threshold - easy_threshold) * x)
+    return threshold
+
 
 WEB_MINER_HTML = """
 <!doctype html>
@@ -92,13 +128,13 @@ WEB_MINER_HTML = """
     button { padding:8px 16px; border-radius:4px; border:none; background:#3a8fff; color:white; cursor:pointer; }
     button:disabled { background:#555; cursor:default; }
     .stat { margin:6px 0; }
-    code { color:#9f9; }
+    code { color:#9f9; word-break:break-all; }
   </style>
 </head>
 <body>
   <div class="box">
     <h1>Cadocurrency Web Miner</h1>
-    <p>Mine with just your <b>username</b>, like DUCO.</p>
+    <p>Mine with just a username. No wallet files, no installs.</p>
     <div>
       <input id="username" placeholder="Enter your username">
       <button id="startBtn">Start Mining</button>
@@ -108,7 +144,7 @@ WEB_MINER_HTML = """
       <div class="stat">Status: <span id="status">Idle</span></div>
       <div class="stat">Hashrate: <span id="hashrate">0</span> H/s</div>
       <div class="stat">Accepted shares: <span id="shares">0</span></div>
-      <div class="stat">Last block height: <span id="height">-</span></div>
+      <div class="stat">Block height: <span id="height">-</span></div>
       <div class="stat">Your balance: <span id="balance">0</span> CADO</div>
       <div class="stat">Last block hash: <code id="lasthash"></code></div>
     </div>
@@ -166,7 +202,7 @@ async function mineLoop() {
       document.getElementById("status").textContent = "Requesting job...";
       const job = await getJob();
       let seed = job.seed;
-      let difficulty = BigInt(job.difficulty);
+      let difficulty = Number(job.difficulty);
       let height = job.height;
 
       document.getElementById("height").textContent = height;
@@ -177,24 +213,24 @@ async function mineLoop() {
       let hashes = 0n;
 
       while (mining) {
-        // hash(seed + nonce) using SHA-1 (Web Crypto)
         let msg = new TextEncoder().encode(seed + nonce.toString());
         let digest = await crypto.subtle.digest("SHA-1", msg);
         let hashArray = Array.from(new Uint8Array(digest));
         let hex = hashArray.map(b => b.toString(16).padStart(2, "0")).join("");
 
-        // convert hash to BigInt
-        let val = BigInt("0x" + hex);
+        // We only really care about the first 5 hex chars, like the server
+        let shortVal = parseInt(hex.slice(0, 5), 16);
+        // The server decides if it's valid, we just submit everything
         hashes++;
 
-        if (val < difficulty) {
+        if (shortVal < 1048576) {
           const res = await submitShare(seed, nonce.toString());
           if (res.accepted) {
             shares++;
             document.getElementById("shares").textContent = shares;
             document.getElementById("balance").textContent = res.balance.toFixed(4);
             document.getElementById("lasthash").textContent = res.hash;
-            document.getElementById("status").textContent = "Share accepted!";
+            document.getElementById("status").textContent = "Share accepted (diff " + res.difficulty + ")";
           } else {
             document.getElementById("status").textContent = "Share rejected: " + (res.error || "");
           }
@@ -223,29 +259,29 @@ async function mineLoop() {
 </html>
 """
 
+
 @app.route("/")
 def webminer():
     return Response(WEB_MINER_HTML, mimetype="text/html")
 
 
-# ---------- API / blockchain ----------
-
 @app.route("/get_job", methods=["POST"])
 def get_job():
     data = request.json or {}
-    miner_id = data.get("miner_id", "unknown")
+    miner_id = data.get("miner_id", "anonymous")
 
     with chain_lock:
         chain = load_chain()
         last_block = chain[-1]
         height = get_height(chain)
         reward = get_block_reward(height + 1)
-        difficulty = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
+
+        current_diff = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
         seed = last_block["hash"]
 
     return jsonify({
         "seed": seed,
-        "difficulty": str(difficulty),
+        "difficulty": current_diff,
         "height": height + 1,
         "reward": reward
     })
@@ -274,10 +310,14 @@ def submit_share():
             return jsonify({"accepted": False, "error": "Stale job"}), 400
 
         height = get_height(chain) + 1
-        diff = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
+        current_diff = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
+        threshold = difficulty_to_threshold(current_diff)
 
         h = sha1_hex(seed + str(nonce))
-        if int(h, 16) >= diff:
+        # First 5 hex digits, DUCO-style
+        hash_val = int(h[:5], 16)
+
+        if hash_val >= threshold:
             return jsonify({"accepted": False, "error": "Invalid share"}), 400
 
         reward = get_block_reward(height)
@@ -315,18 +355,22 @@ def submit_share():
         balances = compute_balances(chain)
         miner_balance = balances.get(miner_id, 0.0)
 
-        # Adaptive difficulty update
         now = time.time()
         prev_time = last_share_time.get(miner_id, now)
         elapsed = now - prev_time if prev_time != now else TARGET_SHARE_TIME
         last_share_time[miner_id] = now
 
-        current_diff = miner_difficulty.get(miner_id, DEFAULT_DIFFICULTY)
+        # If the miner is too fast, make life harder. If they're slow, ease up.
         if elapsed < TARGET_SHARE_TIME:
-            current_diff *= 1.2
+            current_diff += 1
         else:
-            current_diff *= 0.8
-        current_diff = max(MIN_DIFFICULTY, min(current_diff, MAX_DIFFICULTY))
+            current_diff -= 1
+
+        if current_diff < MIN_DIFFICULTY:
+            current_diff = MIN_DIFFICULTY
+        if current_diff > MAX_DIFFICULTY:
+            current_diff = MAX_DIFFICULTY
+
         miner_difficulty[miner_id] = current_diff
 
     return jsonify({
@@ -335,7 +379,7 @@ def submit_share():
         "height": height,
         "reward": reward,
         "balance": miner_balance,
-        "difficulty": str(current_diff),
+        "difficulty": current_diff,
         "share_time": elapsed
     })
 
