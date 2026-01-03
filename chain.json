@@ -1,0 +1,11 @@
+[
+  {
+    "index": 0,
+    "timestamp": 0,
+    "transactions": [],
+    "prev_hash": "0",
+    "nonce": 0,
+    "hash": "0",
+    "miner": "genesis"
+  }
+]
